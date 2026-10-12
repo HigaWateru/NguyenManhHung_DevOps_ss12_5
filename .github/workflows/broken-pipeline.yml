@@ -1,0 +1,121 @@
+name: CI/CD Pipeline - Fix Broken Workflow
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+# Cấp quyền đọc mã nguồn và đẩy package lên GitHub Container Registry (GHCR)
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ==============================================================================
+  # Job 1: Kiểm thử mã nguồn với Gradle (Khắc phục Lỗi 1)
+  # ==============================================================================
+  test:
+    name: Build & Test Gradle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Thiết lập môi trường JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Thiết lập Gradle 8.5
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      # ==========================================================================
+      # KHẮC PHỤC LỖI 1: Permission Denied trên Gradle Wrapper
+      # ==========================================================================
+      # Nguyên nhân lỗi gốc: File gradlew khi commit từ môi trường Windows thiếu cờ
+      # thực thi (+x), dẫn đến lỗi "bash: ./gradlew: Permission denied" (Exit code 126).
+      # Giải pháp: Cấp quyền thực thi trực tiếp bằng lệnh chmod +x trước khi test.
+      - name: Cấp quyền thực thi cho Gradle Wrapper (Fix Lỗi 1)
+        run: chmod +x gradlew
+
+      - name: Chạy Unit Test với Gradle
+        run: ./gradlew test
+
+      - name: Đóng gói tệp JAR với Gradle
+        run: ./gradlew bootJar --no-daemon
+
+      - name: Lưu trữ thành phẩm JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs/*.jar
+          retention-days: 1
+
+  # ==============================================================================
+  # Job 2: Đóng gói và phát hành Docker Image (Khắc phục Lỗi 2 & Lỗi 3)
+  # ==============================================================================
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Tải về thành phẩm JAR từ Job test
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs
+
+      # Chuẩn hóa tên image thành chữ thường (quy định bắt buộc của GHCR & Docker)
+      - name: Chuẩn hóa tên Docker Image thành chữ thường
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Thiết lập Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ==========================================================================
+      # KHẮC PHỤC LỖI 2: Authentication Failed do sai chính tả biến Secret
+      # ==========================================================================
+      # Nguyên nhân lỗi gốc: Biến secret trong kịch bản cũ bị sai chính tả
+      # (${{ secrets.REGISTY_TOKEN }} hoặc ${{ secrets.REGISTRY_TOEKN }}), dẫn đến chuỗi rỗng
+      # và làm docker login thất bại với mã lỗi 401 Unauthorized / Unauthenticated.
+      # Giải pháp: Sửa đúng tên biến bí mật ${{ secrets.REGISTRY_TOKEN }}.
+      # Kết hợp fallback ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }} để đảm bảo
+      # pipeline luôn xác thực thành công ngay cả khi Secret chưa kịp tạo thủ công.
+      - name: Đăng nhập vào GitHub Container Registry (Fix Lỗi 2)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # ==========================================================================
+      # KHẮC PHỤC LỖI 3: Build Context Error do chỉ định sai thư mục làm việc
+      # ==========================================================================
+      # Nguyên nhân lỗi gốc: Tham số context bị trỏ sai (ví dụ context: ./src hoặc ./app)
+      # hoặc file Dockerfile bị sai đường dẫn, dẫn đến lỗi:
+      # "failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory".
+      # Giải pháp: Cấu hình chính xác context: . (thư mục gốc repository) và file: ./Dockerfile.
+      - name: Đóng gói và đẩy Docker Image lên GHCR (Fix Lỗi 3)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
